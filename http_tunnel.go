@@ -34,7 +34,7 @@ type httpDialer struct {
 	forward proxy.Dialer
 }
 
-func NewProxyDialer(u *url.URL, forward proxy.Dialer) (proxy.Dialer, error) {
+func httpDialType(u *url.URL, forward proxy.Dialer) (proxy.Dialer, error) {
 	log.Infoln("Initialize http dialer")
 	var header http.Header
 	if uu := u.User; uu != nil {
@@ -118,6 +118,9 @@ PARSE:
 		c.Close()
 		return nil, e
 	}
+
+	log.Infof("Connected. %#v", resp)
+
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		c.Close()

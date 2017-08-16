@@ -6,15 +6,18 @@ import (
 	"flag"
 	"fmt"
 	log "github.com/Sirupsen/logrus"
+	"github.com/cybozu-go/netutil"
 	"github.com/cybozu-go/transocks"
 	"github.com/elazarl/goproxy"
 	secop "github.com/fardog/secureoperator"
 	"github.com/inconshreveable/go-vhost"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	//"github.com/fardog/secureoperator/cmd"
 	"github.com/miekg/dns"
 	p "golang.org/x/net/proxy"
@@ -237,29 +240,22 @@ func createProxyServer(servers chan bool) []string {
 				}
 				client.Close()
 			}()
-			clientBuf := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
-
-			dialer, err := NewProxyDialer(proxyUrl, p.Direct)
-			orPanic(err)
-
-			remote, err := dialer.Dial("tcp", req.URL.Host)
-			orPanic(err)
-			remoteBuf := bufio.NewReadWriter(bufio.NewReader(remote), bufio.NewWriter(remote))
-			for {
-				req, err := http.ReadRequest(clientBuf.Reader)
-				orPanic(err)
-				orPanic(req.Write(remoteBuf))
-				orPanic(remoteBuf.Flush())
-				resp, err := http.ReadResponse(remoteBuf.Reader, req)
-				orPanic(err)
-				orPanic(resp.Write(clientBuf.Writer))
-				orPanic(clientBuf.Flush())
-			}
 		})
 
 	go func() {
 		log.Fatalln(http.ListenAndServe(*proxyHttpListenAddress, proxy))
 	}()
+
+	pool := sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 64<<10)
+		},
+	}
+	dialer := &net.Dialer{
+		KeepAlive: 3 * time.Minute,
+		DualStack: true,
+	}
+	pdialer, err := p.FromURL(proxyUrl, dialer)
 
 	go func() {
 		log.Infoln("Run HTTPS Listener")
@@ -280,29 +276,95 @@ func createProxyServer(servers chan bool) []string {
 				if err != nil {
 					log.Printf("Error accepting new connection - %v", err)
 				}
-				if tlsConn.Host() == "" {
+
+				defer func() {
+					tlsConn.Free()
+				}()
+
+				dest := tlsConn.Host()
+				if dest == "" {
 					log.Printf("Cannot support non-SNI enabled clients")
 					return
 				}
 
-				log.Infof("Proxy to %s", tlsConn.Host())
+				log.Infof("Proxy to %s", dest)
 
-				connectReq := &http.Request{
-					Method: "CONNECT",
-					URL: &url.URL{
-						Opaque: tlsConn.Host(),
-						Host:   net.JoinHostPort(tlsConn.Host(), "443"),
-					},
-					Host:   tlsConn.Host(),
-					Header: make(http.Header),
-				}
-				resp := dumbResponseWriter{tlsConn}
-				proxy.ServeHTTP(resp, connectReq)
+				handleConnection(c, pool, pdialer, dest, tlsConn.ClientHelloMsg.Raw)
 			}(c)
 		}
 	}()
 
 	return []string{*proxyHttpListenAddress, *proxyHttpsListenAddress}
+}
+
+func handleConnection(conn net.Conn, pool sync.Pool, dialer p.Dialer, addr string, clientHello []byte) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		log.Error("non-TCP connection", map[string]interface{}{
+			"conn": conn,
+		})
+		return
+	}
+
+	destConn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		log.Error("failed to connect to proxy server")
+		return
+	}
+	defer destConn.Close()
+
+	log.Info("proxy starts")
+
+	wg := &sync.WaitGroup{}
+
+	log.Infof("send clientHello start %d", len(clientHello))
+
+	length := len(clientHello)
+
+	header := []byte{0x16, 0x03, 0x01, byte(length >> 8), byte(length)}
+
+	record := append(header, clientHello...)
+
+	destConn.Write(record)
+
+	log.Info("send clientHello over proxy")
+
+	// do proxy
+	wg.Add(1)
+	go func() error {
+		defer func() {
+			wg.Done()
+		}()
+
+		buf := pool.Get().([]byte)
+		_, err := io.CopyBuffer(destConn, tc, buf)
+		pool.Put(buf)
+		if hc, ok := destConn.(netutil.HalfCloser); ok {
+			hc.CloseWrite()
+		}
+		tc.CloseRead()
+		return err
+	}()
+
+	wg.Add(1)
+	go func() error {
+		defer func() {
+			wg.Done()
+		}()
+
+		buf := pool.Get().([]byte)
+		_, err := io.CopyBuffer(tc, destConn, buf)
+		pool.Put(buf)
+		tc.CloseWrite()
+		if hc, ok := destConn.(netutil.HalfCloser); ok {
+			hc.CloseRead()
+		}
+		return err
+	}()
+
+	wg.Wait()
+
+	log.Info("proxy ends")
 }
 
 func main() {
