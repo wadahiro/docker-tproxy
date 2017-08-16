@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	log "github.com/Sirupsen/logrus"
-	clog "github.com/cybozu-go/log"
 	"github.com/cybozu-go/transocks"
 	"github.com/elazarl/goproxy"
 	secop "github.com/fardog/secureoperator"
+	"github.com/inconshreveable/go-vhost"
 	"net"
+	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	//"github.com/fardog/secureoperator/cmd"
 	"github.com/miekg/dns"
+	p "golang.org/x/net/proxy"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -20,6 +25,12 @@ import (
 	"syscall"
 	"time"
 )
+
+func orPanic(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
 
 var (
 	logLevel = flag.String(
@@ -32,8 +43,12 @@ var (
 		"proxy-url", "", "Proxy URL, like `http://user:pass@yourproxy.org`",
 	)
 
-	proxyListenAddress = flag.String(
-		"proxy-listen", ":3128", "Proxy listen address, as `[host]:port`",
+	proxyHttpListenAddress = flag.String(
+		"proxy-http-listen", ":3128", "Proxy http listen address, as `[host]:port`",
+	)
+
+	proxyHttpsListenAddress = flag.String(
+		"proxy-https-listen", ":3129", "Proxy https listen address, as `[host]:port`",
 	)
 
 	dnsListenAddress = flag.String(
@@ -191,28 +206,103 @@ func createDNSServer(servers chan bool) []string {
 }
 
 func createProxyServer(servers chan bool) []string {
-	c := transocks.NewConfig()
-	c.Addr = *proxyListenAddress
-
-	u, err := url.Parse(*proxyURL)
+	proxyUrl, err := url.Parse(*proxyURL)
 	if err != nil {
 		log.Fatalf("Invalid proxy-url: %s", err.Error())
 	}
-	c.ProxyURL = u
 
-	if err != nil {
-		log.Fatalf("Invalid proxy config: %s", err.Error())
-	}
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Verbose = true
+	log.Infof("proxy.Tr, %#v", proxy.Tr)
+	proxy.ConnectDial = nil
 
-	logger := clog.DefaultLogger()
-	logger.SetThresholdByName(*logLevel)
-	c.Logger = logger
+	proxy.NonproxyHandler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		log.Infof("NonproxyHandler handle: %s, %#v", req.Host, req.URL)
+		if req.Host == "" {
+			fmt.Fprintln(w, "Cannot handle requests without Host header, e.g., HTTP 1.0")
+			return
+		}
+		req.URL.Scheme = "http"
+		req.URL.Host = req.Host
+		proxy.ServeHTTP(w, req)
+	})
 
-	log.Infof("Proxy Config: %#v", c)
+	proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(".*"))).
+		HijackConnect(func(req *http.Request, client net.Conn, ctx *goproxy.ProxyCtx) {
+			log.Infof("HijackConnect: %s, %#v", req.Host, req.URL)
+			defer func() {
+				if e := recover(); e != nil {
+					ctx.Logf("error connecting to remote: %v", e)
+					client.Write([]byte("HTTP/1.1 500 Cannot reach destination\r\n\r\n"))
+				}
+				client.Close()
+			}()
+			clientBuf := bufio.NewReadWriter(bufio.NewReader(client), bufio.NewWriter(client))
 
-	serveHTTP(c)
+			dialer, err := NewProxyDialer(proxyUrl, p.Direct)
+			orPanic(err)
 
-	return []string{c.Addr}
+			remote, err := dialer.Dial("tcp", req.URL.Host)
+			orPanic(err)
+			remoteBuf := bufio.NewReadWriter(bufio.NewReader(remote), bufio.NewWriter(remote))
+			for {
+				req, err := http.ReadRequest(clientBuf.Reader)
+				orPanic(err)
+				orPanic(req.Write(remoteBuf))
+				orPanic(remoteBuf.Flush())
+				resp, err := http.ReadResponse(remoteBuf.Reader, req)
+				orPanic(err)
+				orPanic(resp.Write(clientBuf.Writer))
+				orPanic(clientBuf.Flush())
+			}
+		})
+
+	go func() {
+		log.Fatalln(http.ListenAndServe(*proxyHttpListenAddress, proxy))
+	}()
+
+	go func() {
+		log.Infoln("Run HTTPS Listener")
+		// listen to the TLS ClientHello but make it a CONNECT request instead
+		ln, err := net.Listen("tcp", *proxyHttpsListenAddress)
+		if err != nil {
+			log.Fatalf("Error listening for https connections - %v", err)
+		}
+		for {
+			c, err := ln.Accept()
+			log.Infoln("Accepted HTTPS connection")
+			if err != nil {
+				log.Printf("Error accepting new connection - %v", err)
+				continue
+			}
+			go func(c net.Conn) {
+				tlsConn, err := vhost.TLS(c)
+				if err != nil {
+					log.Printf("Error accepting new connection - %v", err)
+				}
+				if tlsConn.Host() == "" {
+					log.Printf("Cannot support non-SNI enabled clients")
+					return
+				}
+
+				log.Infof("Proxy to %s", tlsConn.Host())
+
+				connectReq := &http.Request{
+					Method: "CONNECT",
+					URL: &url.URL{
+						Opaque: tlsConn.Host(),
+						Host:   net.JoinHostPort(tlsConn.Host(), "443"),
+					},
+					Host:   tlsConn.Host(),
+					Header: make(http.Header),
+				}
+				resp := dumbResponseWriter{tlsConn}
+				proxy.ServeHTTP(resp, connectReq)
+			}(c)
+		}
+	}()
+
+	return []string{*proxyHttpListenAddress, *proxyHttpsListenAddress}
 }
 
 func main() {
@@ -251,4 +341,27 @@ func main() {
 	}
 
 	log.Infoln("Servers exited, stopping")
+}
+
+type dumbResponseWriter struct {
+	net.Conn
+}
+
+func (dumb dumbResponseWriter) Header() http.Header {
+	panic("Header() should not be called on this ResponseWriter")
+}
+
+func (dumb dumbResponseWriter) Write(buf []byte) (int, error) {
+	if bytes.Equal(buf, []byte("HTTP/1.0 200 OK\r\n\r\n")) {
+		return len(buf), nil // throw away the HTTP OK response from the faux CONNECT request
+	}
+	return dumb.Conn.Write(buf)
+}
+
+func (dumb dumbResponseWriter) WriteHeader(code int) {
+	panic("WriteHeader() should not be called on this ResponseWriter")
+}
+
+func (dumb dumbResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return dumb, bufio.NewReadWriter(bufio.NewReader(dumb), bufio.NewWriter(dumb)), nil
 }

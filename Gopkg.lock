@@ -32,16 +32,22 @@
   version = "v1.0.0"
 
 [[projects]]
+  branch = "master"
   name = "github.com/elazarl/goproxy"
   packages = ["."]
-  revision = "0a5b8bdb09049ae4ae68e75437ded0b7a2e324e3"
-  version = "v1.0"
+  revision = "aacba83f36a55ac31cbb71c06547a328c0cd1604"
 
 [[projects]]
   name = "github.com/fardog/secureoperator"
   packages = ["."]
   revision = "8dfe895db8ee70568ec900451d0a3b2ce9ec9866"
   version = "v2.1.0"
+
+[[projects]]
+  branch = "master"
+  name = "github.com/inconshreveable/go-vhost"
+  packages = ["."]
+  revision = "06d84117953b22058c096b49a429ebd4f3d3d97b"
 
 [[projects]]
   branch = "master"
@@ -70,6 +76,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "e0a174a7af393fdf87c8dc1bbd52e1cba144655b08dc1c17a66bc7a5d87324f0"
+  inputs-digest = "b8975479217cff9bee3787044f8bddbed40ea7e86d3ca32a5eeb89cac790bc68"
   solver-name = "gps-cdcl"
   solver-version = 1
