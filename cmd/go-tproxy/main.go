@@ -9,22 +9,20 @@ import (
 	"github.com/cybozu-go/netutil"
 	"github.com/cybozu-go/transocks"
 	"github.com/elazarl/goproxy"
-	secop "github.com/fardog/secureoperator"
 	"github.com/inconshreveable/go-vhost"
+	"github.com/wadahiro/go-tproxy"
+	p "golang.org/x/net/proxy"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strings"
-	"sync"
-	//"github.com/fardog/secureoperator/cmd"
-	"github.com/miekg/dns"
-	p "golang.org/x/net/proxy"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -65,12 +63,6 @@ var (
 		"List of internal subdomains where to send queries")
 	dnsRoutes []string
 
-	dnsNoPad = flag.Bool(
-		"dns-no-pad",
-		false,
-		"Disable padding of Google DNS-over-HTTPS requests to identical length",
-	)
-
 	dnsEndpoint = flag.String(
 		"dns-endpoint",
 		"https://dns.google.com/resolve",
@@ -80,27 +72,6 @@ var (
 	dnsEnableTCP = flag.Bool("dns-tcp", true, "DNS Listen on TCP")
 	dnsEnableUDP = flag.Bool("dns-udp", true, "DNS Listen on UDP")
 )
-
-func serveDNS(net string) {
-	log.Infof("Starting %s service on %s", net, *dnsListenAddress)
-
-	server := &dns.Server{Addr: *dnsListenAddress, Net: net, TsigSecret: nil}
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatal(err.Error())
-		}
-	}()
-
-	// serve until exit
-	sig := make(chan os.Signal)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
-	log.Infof("Shutting down %s on interrupt\n", net)
-	if err := server.Shutdown(); err != nil {
-		log.Errorf("Got unexpected error %s", err.Error())
-	}
-}
 
 func serveHTTP(c *transocks.Config) {
 	s, err := transocks.NewServer(c)
@@ -120,92 +91,6 @@ func serveHTTP(c *transocks.Config) {
 	<-sig
 
 	log.Info("Shutting down proxy server on interrupt\n")
-}
-
-func dnsProxy(addr string, w dns.ResponseWriter, req *dns.Msg) {
-	transport := "udp"
-	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
-		transport = "tcp"
-	}
-	c := &dns.Client{
-		Net:     transport,
-		Timeout: time.Duration(10) * time.Second,
-	}
-	log.Infof("DNS request. %#v, %s", req, req)
-	resp, _, err := c.Exchange(req, addr)
-	if err != nil {
-		log.Warnf("DNS Client failed. %s, %#v, %s", err.Error(), req, req)
-		dns.HandleFailed(w, req)
-		return
-	}
-	w.WriteMsg(resp)
-}
-
-func createDNSServer(servers chan bool) []string {
-	provider, err := secop.NewGDNSProvider(*dnsEndpoint, &secop.GDNSOptions{
-		Pad: !*dnsNoPad,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Infof("Internal DNS setting, %s, %s", *dnsInternalServer, *dnsInternalDomains)
-
-	if *dnsInternalServer != "" {
-		if !strings.HasSuffix(*dnsInternalServer, ":53") {
-			*dnsInternalServer += ":53"
-		}
-	}
-
-	if *dnsInternalDomains != "" {
-		for _, s := range strings.Split(*dnsInternalDomains, ",") {
-			if !strings.HasSuffix(s, ".") {
-				s += "."
-			}
-			dnsRoutes = append(dnsRoutes, s)
-		}
-	}
-
-	options := &secop.HandlerOptions{}
-	handler := secop.NewHandler(provider, options)
-
-	dnsHandle := func(w dns.ResponseWriter, req *dns.Msg) {
-		if len(req.Question) == 0 {
-			dns.HandleFailed(w, req)
-			return
-		}
-		// Resolve by Internal DNSServer
-		for _, name := range dnsRoutes {
-			log.Infof("Matching DNS route,  %s : %s\n", req.Question[0].Name, name)
-			if strings.HasSuffix(req.Question[0].Name, name) {
-				log.Info("Matched")
-				dnsProxy(*dnsInternalServer, w, req)
-				return
-			}
-		}
-
-		// Resolve by External DNS over HTTPS
-		handler.Handle(w, req)
-	}
-
-	dns.HandleFunc(".", dnsHandle)
-
-	var protocols []string
-	if *dnsEnableTCP {
-		protocols = append(protocols, "tcp")
-	}
-	if *dnsEnableUDP {
-		protocols = append(protocols, "udp")
-	}
-
-	for _, protocol := range protocols {
-		go func(protocol string) {
-			serveDNS(protocol)
-			servers <- true
-		}(protocol)
-	}
-
-	return protocols
 }
 
 func createProxyServer(servers chan bool) []string {
@@ -392,17 +277,33 @@ func main() {
 
 	servers := make(chan bool)
 
-	dnsLns := createDNSServer(servers)
-	proxyLns := createProxyServer(servers)
+	dnsServer := tproxy.NewDNSServer(
+		tproxy.DNSConfig{
+			ListenAddress:   *dnsListenAddress,
+			EnableUDP:       *dnsEnableUDP,
+			EnableTCP:       *dnsEnableTCP,
+			Endpoint:        *dnsEndpoint,
+			InternalDNS:     *dnsInternalServer,
+			InternalDomains: strings.Split(*dnsInternalDomains, ","),
+		},
+	)
+	dnsServer.Run()
 
-	lns := append(dnsLns, proxyLns...)
+	createProxyServer(servers)
 
-	// wait for all servers to exit
-	for i := 0; i < len(lns); i++ {
-		<-servers
-	}
+	log.Infoln("tproxy servers started.")
 
-	log.Infoln("Servers exited, stopping")
+	// serve until exit
+	sig := make(chan os.Signal)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+
+	log.Infoln("tproxy servers stopping.")
+
+	// start shutdown
+	dnsServer.Stop()
+
+	log.Infoln("tproxy servers exited.")
 }
 
 type dumbResponseWriter struct {
