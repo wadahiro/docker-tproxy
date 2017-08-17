@@ -7,6 +7,9 @@ import (
 	"github.com/cybozu-go/transocks"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 )
 
@@ -121,4 +124,35 @@ func Pipe(srcConn *TCPConn, destConn net.Conn) {
 	wg.Wait()
 
 	log.Info("End proxy")
+}
+
+func httpProxyFromRule(noProxyDomains, noProxyAddresses []string) func(*http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		if useProxy(noProxyDomains, noProxyAddresses,
+			strings.Split(req.Host, ":")[0]) {
+
+			return http.ProxyFromEnvironment(req)
+		} else {
+			return nil, nil
+		}
+	}
+}
+
+func useProxy(noProxyDomains, noProxyAddresses []string, target string) bool {
+	for _, domain := range noProxyDomains {
+		if strings.HasSuffix(target, domain) {
+			log.Infof("Direct for %s", target)
+			return false
+		}
+	}
+
+	for _, addr := range noProxyAddresses {
+		if addr == target {
+			log.Infof("Direct for %s", target)
+			return false
+		}
+	}
+
+	log.Infof("Use proxy for %s", target)
+	return true
 }

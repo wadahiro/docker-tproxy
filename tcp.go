@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -42,11 +43,21 @@ func (s TCPProxy) Run() error {
 		return err
 	}
 
+	npdialer := proxy.Direct
+
 	log.Infof("Tcp-Proxy: Run listener on %s", s.ListenAddress)
 
 	go func() {
 		ListenTCP(s.ListenAddress, func(tc *TCPConn) {
-			destConn, err := pdialer.Dial("tcp", tc.OrigAddr)
+			var destConn net.Conn
+			if useProxy(s.NoProxyDomains, s.NoProxyAddresses,
+				strings.Split(tc.OrigAddr, ":")[0]) {
+
+				destConn, err = pdialer.Dial("tcp", tc.OrigAddr)
+			} else {
+				destConn, err = npdialer.Dial("tcp", tc.OrigAddr)
+			}
+
 			if err != nil {
 				log.Errorf("TCP-Proxy: Failed to connect to destination - %s", err.Error())
 				return

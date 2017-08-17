@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -41,6 +42,8 @@ func (s HTTPSProxy) Run() error {
 		return err
 	}
 
+	npdialer := proxy.Direct
+
 	log.Infof("HTTPS-Proxy: Run listener on %s", s.ListenAddress)
 
 	go func() {
@@ -63,11 +66,18 @@ func (s HTTPSProxy) Run() error {
 				// TODO getting domain from origAddr, then check whether we should use proxy or not
 			} else {
 				log.Infof("HTTPS-Proxy: SNI: %s", origServer)
-
-				//origServer = net.JoinHostPort(origServer, "443")
+				origServer = net.JoinHostPort(origServer, "443")
 			}
 
-			destConn, err := pdialer.Dial("tcp", origServer)
+			var destConn net.Conn
+			if useProxy(s.NoProxyDomains, s.NoProxyAddresses,
+				strings.Split(origServer, ":")[0]) {
+
+				destConn, err = pdialer.Dial("tcp", origServer)
+			} else {
+				destConn, err = npdialer.Dial("tcp", origServer)
+			}
+
 			if err != nil {
 				log.Errorf("HTTPS-Proxy: Failed to connect to destination - %s", err.Error())
 				return
