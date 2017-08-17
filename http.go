@@ -50,6 +50,8 @@ func (s HTTPProxy) Run() error {
 		proxy.ServeHTTP(w, req)
 	})
 
+	log.Infof("HTTP-Proxy: Run listener on %s", s.ListenAddress)
+
 	go func() {
 		http.Serve(l, proxy)
 	}()

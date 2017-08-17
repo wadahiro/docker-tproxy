@@ -5,6 +5,9 @@ import (
 	"github.com/inconshreveable/go-vhost"
 	"golang.org/x/net/proxy"
 	"net"
+	"net/url"
+	"os"
+	"time"
 )
 
 type HTTPSProxy struct {
@@ -24,9 +27,21 @@ func NewHTTPSProxy(c HTTPSProxyConfig) *HTTPSProxy {
 }
 
 func (s HTTPSProxy) Run() error {
-	pdialer := proxy.FromEnvironment()
+	dialer := &net.Dialer{
+		KeepAlive: 3 * time.Minute,
+		DualStack: true,
+	}
+	u, err := url.Parse(os.Getenv("http_proxy"))
+	if err != nil {
+		return err
+	}
 
-	log.Infoln("HTTPS-Proxy: Run listener")
+	pdialer, err := proxy.FromURL(u, dialer)
+	if err != nil {
+		return err
+	}
+
+	log.Infof("HTTPS-Proxy: Run listener on %s", s.ListenAddress)
 
 	go func() {
 		ListenTCP(s.ListenAddress, func(tc *TCPConn) {
@@ -48,7 +63,8 @@ func (s HTTPSProxy) Run() error {
 				// TODO getting domain from origAddr, then check whether we should use proxy or not
 			} else {
 				log.Infof("HTTPS-Proxy: SNI: %s", origServer)
-				origServer = net.JoinHostPort(origServer, "443")
+
+				//origServer = net.JoinHostPort(origServer, "443")
 			}
 
 			destConn, err := pdialer.Dial("tcp", origServer)
