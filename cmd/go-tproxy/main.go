@@ -6,7 +6,6 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/wadahiro/go-tproxy"
 	"math/rand"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,23 +27,26 @@ var (
 		"Log level, one of: debug, info, warn, error, fatal, panic",
 	)
 
-	proxyURL = flag.String(
-		"proxy-url", "", "Proxy URL, like `http://user:pass@yourproxy.org`",
-	)
+	noProxyAddresses = flag.String("no-proxy-addresses", "",
+		"List of no proxy ip addresses, as `192.168.0.10` or `192.168.0.0/24`")
 
-	noproxyDomains = flag.String("noproxy-domains", "",
+	noProxyDomains = flag.String("no-proxy-domains", "",
 		"List of noproxy subdomains")
 
-	proxyHttpListenAddress = flag.String(
-		"proxy-http-listen", ":3128", "Proxy http listen address, as `[host]:port`",
+	tcpProxyListenAddress = flag.String(
+		"tcp-proxy-listen", ":3128", "TCP Proxy listen address, as `[host]:port`",
 	)
 
-	proxyHttpsListenAddress = flag.String(
-		"proxy-https-listen", ":3129", "Proxy https listen address, as `[host]:port`",
+	httpProxyListenAddress = flag.String(
+		"http-proxy-listen", ":3129", "HTTP Proxy listen address, as `[host]:port`",
 	)
 
-	dnsListenAddress = flag.String(
-		"dns-listen", ":53", "DNS listen address, as `[host]:port`",
+	httpsProxyListenAddress = flag.String(
+		"https-proxy-listen", ":3130", "HTTPS Proxy listen address, as `[host]:port`",
+	)
+
+	dnsProxyListenAddress = flag.String(
+		"dns-proxy-listen", ":3131", "DNS Proxy listen address, as `[host]:port`",
 	)
 
 	dnsInternalServer = flag.String("dns-internal-server", "",
@@ -83,33 +85,49 @@ func main() {
 	log.SetFormatter(formatter)
 	log.SetLevel(level)
 
-	u, err := url.Parse(*proxyURL)
-	if err != nil {
-		log.Fatalf("Invalid proxy-url. %s", err.Error())
+	// start servers
+	tcpProxy := tproxy.NewTCPProxy(
+		tproxy.TCPProxyConfig{
+			ListenAddress:    *tcpProxyListenAddress,
+			NoProxyAddresses: strings.Split(*noProxyAddresses, ","),
+			NoProxyDomains:   strings.Split(*noProxyDomains, ","),
+		},
+	)
+	if err := tcpProxy.Run(); err != nil {
+		log.Fatalf(err.Error())
 	}
 
-	// start servers
-	dnsServer := tproxy.NewDNSServer(
-		tproxy.DNSConfig{
-			ListenAddress:   *dnsListenAddress,
-			EnableUDP:       *dnsEnableUDP,
-			EnableTCP:       *dnsEnableTCP,
-			Endpoint:        *dnsEndpoint,
-			InternalDNS:     *dnsInternalServer,
-			InternalDomains: strings.Split(*noproxyDomains, ","),
+	dnsProxy := tproxy.NewDNSProxy(
+		tproxy.DNSProxyConfig{
+			ListenAddress:  *dnsProxyListenAddress,
+			EnableUDP:      *dnsEnableUDP,
+			EnableTCP:      *dnsEnableTCP,
+			Endpoint:       *dnsEndpoint,
+			InternalDNS:    *dnsInternalServer,
+			NoProxyDomains: strings.Split(*noProxyDomains, ","),
 		},
 	)
-	dnsServer.Run()
+	dnsProxy.Run()
 
-	httpServer := tproxy.NewHTTPServer(
-		tproxy.HTTPConfig{
-			HTTPListenAddress:  *proxyHttpListenAddress,
-			HTTPSListenAddress: *proxyHttpsListenAddress,
-			ProxyURL:           u,
-			InternalDomains:    strings.Split(*noproxyDomains, ","),
+	httpProxy := tproxy.NewHTTPProxy(
+		tproxy.HTTPProxyConfig{
+			ListenAddress:    *httpProxyListenAddress,
+			NoProxyAddresses: strings.Split(*noProxyAddresses, ","),
+			NoProxyDomains:   strings.Split(*noProxyDomains, ","),
 		},
 	)
-	if err := httpServer.Run(); err != nil {
+	if err := httpProxy.Run(); err != nil {
+		log.Fatalf(err.Error())
+	}
+
+	httpsProxy := tproxy.NewHTTPSProxy(
+		tproxy.HTTPSProxyConfig{
+			ListenAddress:    *httpsProxyListenAddress,
+			NoProxyAddresses: strings.Split(*noProxyAddresses, ","),
+			NoProxyDomains:   strings.Split(*noProxyDomains, ","),
+		},
+	)
+	if err := httpsProxy.Run(); err != nil {
 		log.Fatalf(err.Error())
 	}
 
@@ -123,7 +141,7 @@ func main() {
 	log.Infoln("tproxy servers stopping.")
 
 	// start shutdown
-	dnsServer.Stop()
+	dnsProxy.Stop()
 
 	log.Infoln("tproxy servers exited.")
 }

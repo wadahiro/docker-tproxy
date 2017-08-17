@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-type DNSServer struct {
-	DNSConfig
+type DNSProxy struct {
+	DNSProxyConfig
 	udpServer *dns.Server
 	tcpServer *dns.Server
 	udpClient *dns.Client // used for fowarding to internal DNS
@@ -19,16 +19,16 @@ type DNSServer struct {
 	waitGroup *sync.WaitGroup
 }
 
-type DNSConfig struct {
-	ListenAddress   string
-	EnableUDP       bool
-	EnableTCP       bool
-	Endpoint        string
-	InternalDNS     string
-	InternalDomains []string
+type DNSProxyConfig struct {
+	ListenAddress  string
+	EnableUDP      bool
+	EnableTCP      bool
+	Endpoint       string
+	InternalDNS    string
+	NoProxyDomains []string
 }
 
-func NewDNSServer(c DNSConfig) *DNSServer {
+func NewDNSProxy(c DNSProxyConfig) *DNSProxy {
 
 	// fix internal dns address
 	if c.InternalDNS != "" {
@@ -38,19 +38,19 @@ func NewDNSServer(c DNSConfig) *DNSServer {
 	}
 
 	// fix domains
-	var dnsRoutes []string
-	for _, s := range c.InternalDomains {
+	var noProxyRoutes []string
+	for _, s := range c.NoProxyDomains {
 		if !strings.HasSuffix(s, ".") {
 			s += "."
 		}
-		dnsRoutes = append(dnsRoutes, s)
+		noProxyRoutes = append(noProxyRoutes, s)
 	}
-	c.InternalDomains = dnsRoutes
+	c.NoProxyDomains = noProxyRoutes
 
-	return &DNSServer{
-		DNSConfig: c,
-		udpServer: nil,
-		tcpServer: nil,
+	return &DNSProxy{
+		DNSProxyConfig: c,
+		udpServer:      nil,
+		tcpServer:      nil,
 		udpClient: &dns.Client{
 			Net:            "udp",
 			Timeout:        time.Duration(10) * time.Second,
@@ -65,9 +65,9 @@ func NewDNSServer(c DNSConfig) *DNSServer {
 	}
 }
 
-func (s *DNSServer) Run() error {
+func (s *DNSProxy) Run() error {
 	log.Infof("Starting DNS service on %s", s.ListenAddress)
-	log.Infof("Internal DNS setting, %s, %s", s.InternalDNS, s.InternalDomains)
+	log.Infof("Use internal DNS %s for %s domains", s.InternalDNS, s.NoProxyDomains)
 
 	// Prepare external DNS handler
 	provider, err := secop.NewGDNSProvider(s.Endpoint, &secop.GDNSOptions{
@@ -87,8 +87,8 @@ func (s *DNSServer) Run() error {
 			dns.HandleFailed(w, req)
 			return
 		}
-		// Resolve by Internal DNSServer
-		for _, domain := range s.InternalDomains {
+		// Resolve by Internal DNSProxy
+		for _, domain := range s.NoProxyDomains {
 			log.Infof("Matching DNS route,  %s : %s\n", req.Question[0].Name, domain)
 			if strings.HasSuffix(req.Question[0].Name, domain) {
 				log.Info("Matched! Routing to internal DNS")
@@ -136,7 +136,7 @@ func (s *DNSServer) Run() error {
 	return nil
 }
 
-func (s *DNSServer) handleInternal(w dns.ResponseWriter, req *dns.Msg) {
+func (s *DNSProxy) handleInternal(w dns.ResponseWriter, req *dns.Msg) {
 	var c *dns.Client
 	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
 		c = s.tcpClient
@@ -155,7 +155,7 @@ func (s *DNSServer) handleInternal(w dns.ResponseWriter, req *dns.Msg) {
 	w.WriteMsg(resp)
 }
 
-func (s *DNSServer) Stop() {
+func (s *DNSProxy) Stop() {
 	log.Infof("Shutting down DNS service on interrupt\n")
 
 	if s.udpServer != nil {
